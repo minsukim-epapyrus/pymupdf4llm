@@ -90,7 +90,16 @@ def get_raw_lines(
             # no more than 10% of the font size separates them and important
             # attributes are the same.
             delta = s1["size"] * 0.1
-            if s0["bbox"].x1 + delta < s1["bbox"].x0 or (
+            # ReStyle D7: do not join a small span that is also baseline-shifted
+            # from its neighbour — a superscript/subscript marker ([22], footnote
+            # number). Merging it erases the size/baseline that marks it as sup/sub.
+            # Same-size word fragments and larger drop-caps (same baseline) still
+            # join normally, so titles like "OVERVIEW" are not fragmented.
+            _lo, _hi = (s0, s1) if s0["size"] <= s1["size"] else (s1, s0)
+            _size_split = _lo["size"] < 0.85 * _hi["size"] and (
+                abs(_lo["origin"][1] - _hi["origin"][1]) > 0.1 * _hi["size"]
+            )
+            if _size_split or s0["bbox"].x1 + delta < s1["bbox"].x0 or (
                 s0["flags"],
                 s0["char_flags"] & ~2,
                 # s0["size"],

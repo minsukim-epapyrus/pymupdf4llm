@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Union
 import textwrap
 
 import pymupdf
+import numpy as np
 import tabulate
 from pymupdf import mupdf
 from pymupdf4llm.helpers import utils
@@ -435,7 +436,7 @@ def fallback_text_to_text(textlines, ignore_code: bool = False, clip=None):
     return output + "\n"
 
 
-def get_styled_text(spans):
+def _get_styled_text_legacy(spans, geom_sup=True):
     """Output text with markdown style codes based on font properties.
     Parameter is a list of span dictionaries. The spans may come from
     one or more original "textlines" items.
@@ -448,9 +449,58 @@ def get_styled_text(spans):
     old_line = 0
     old_block = 0
 
+    # ReStyle D7 (TextStyle Recovery): geometric superscript detection. MuPDF's
+    # TEXT_FONT_SUPERSCRIPT flag misses raised citation markers ([22], footnote
+    # numbers) that are smaller than the line and sit above its baseline. Per
+    # line, take the largest span as the body size and the baseline of full-size
+    # spans; a smaller, raised span is a superscript.
+    _line_norm = {}
+    for _s in spans:
+        _line_norm.setdefault(_s.get("line", 0), []).append(_s)
+    _norm = {}
+    for _ln, _ss in _line_norm.items():
+        _nsz = max(x["size"] for x in _ss)
+        _base = max(
+            (x["origin"][1] for x in _ss if x["size"] >= 0.95 * _nsz),
+            default=None,
+        )
+        _norm[_ln] = (_nsz, _base)
+
+    def _geom_sup(sp):
+        # a superscript marker is short (a citation/footnote number); this guard
+        # also prevents a smaller-font neighbouring column (merged onto the same
+        # line in interleaved multi-column layouts) from being flagged wholesale.
+        _t = sp["text"].strip()
+        if len(_t) > 10 or not any(c.isalnum() for c in _t):
+            return False  # too long, or pure punctuation (a raised quote/period)
+        _nsz, _base = _norm.get(sp.get("line", 0), (0, None))
+        if not _nsz or _base is None:
+            return False
+        if sp["size"] >= 0.85 * _nsz:  # not smaller than body
+            return False
+        return sp["origin"][1] < _base - 0.1 * _nsz  # raised above the baseline
+
+    def _geom_sub(sp):
+        # ReStyle D7-sub: geometric subscript — the mirror of _geom_sup. MuPDF has
+        # no subscript flag at all (only TEXT_FONT_SUPERSCRIPT), so a lowered small
+        # span (chemical formula H2O, math subscript) can only be recovered
+        # geometrically. Same short-marker/alnum/size guards; baseline is *below*.
+        _t = sp["text"].strip()
+        if len(_t) > 10 or not any(c.isalnum() for c in _t):
+            return False
+        _nsz, _base = _norm.get(sp.get("line", 0), (0, None))
+        if not _nsz or _base is None:
+            return False
+        if sp["size"] >= 0.85 * _nsz:  # not smaller than body
+            return False
+        return sp["origin"][1] > _base + 0.1 * _nsz  # dropped below the baseline
+
     for i, s in enumerate(spans):
         # decode font flags and char_flags properties
-        superscript = s["flags"] & pymupdf.TEXT_FONT_SUPERSCRIPT
+        superscript = (s["flags"] & pymupdf.TEXT_FONT_SUPERSCRIPT) or (
+            geom_sup and _geom_sup(s)
+        )
+        subscript = geom_sup and not superscript and _geom_sub(s)
         mono = s["flags"] & pymupdf.TEXT_FONT_MONOSPACED and not utils.is_ocr_text(s)
         bold = (
             s["flags"] & pymupdf.TEXT_FONT_BOLD
@@ -468,6 +518,10 @@ def get_styled_text(spans):
         if superscript:
             prefix.append("<sup>")
             suffix.append("</sup>")
+
+        if subscript:
+            prefix.append("<sub>")
+            suffix.append("</sub>")
 
         if bold:
             prefix.append("**")
@@ -524,10 +578,109 @@ def get_styled_text(spans):
 
         old_line = s["line"]
         old_block = s["block"]
-        if superscript:
+        if superscript or subscript:
+            output = output.rstrip(" ")  # attach the marker to the preceding word
+        if s.get("_restyle_join_left"):
             output = output.rstrip(" ")
+            text = text.lstrip(" ")
         output += text
     return output, suffix
+
+
+def _outer_style_signature(span):
+    """Return shared outer Markdown styles and eligibility for coalescing."""
+    bold = bool(
+        span["flags"] & pymupdf.TEXT_FONT_BOLD
+        or span["char_flags"] & pymupdf.mupdf.FZ_STEXT_BOLD
+    )
+    italic = bool(span["flags"] & pymupdf.TEXT_FONT_ITALIC)
+    # Sup/sub and monospace have attachment / delimiter semantics of their own.
+    # Keep those paths on the established serializer.
+    eligible = not (
+        span["flags"]
+        & (pymupdf.TEXT_FONT_SUPERSCRIPT | pymupdf.TEXT_FONT_MONOSPACED)
+    )
+    return (bold, italic), eligible
+
+
+def _inner_decorator_signature(span):
+    mask = (
+        pymupdf.mupdf.FZ_STEXT_STRIKEOUT
+        | pymupdf.mupdf.FZ_STEXT_UNDERLINE
+        | pymupdf.mupdf.FZ_STEXT_HIGHLIGHT
+    )
+    return span["char_flags"] & mask
+
+
+def _coalesce_outer_style_runs(spans, geom_sup):
+    """Keep shared bold/italic outside D8 decorator transitions.
+
+    A D8 character-range split can introduce an inner underline/strike boundary
+    in a sentence that remains bold or italic throughout. Render the varying
+    decorators first, then expose the whole run to the established serializer as
+    one span carrying only the common outer styles.
+    """
+    result = []
+    pos = 0
+    while pos < len(spans):
+        outer, eligible = _outer_style_signature(spans[pos])
+        if not any(outer) or not eligible:
+            result.append(spans[pos])
+            pos += 1
+            continue
+
+        size = spans[pos]["size"]
+        stop = pos + 1
+        while stop < len(spans):
+            this_outer, this_eligible = _outer_style_signature(spans[stop])
+            if (
+                this_outer != outer
+                or not this_eligible
+                or abs(spans[stop]["size"] - size) > 0.05 * max(size, 1)
+            ):
+                break
+            stop += 1
+
+        run = spans[pos:stop]
+        decorators = {_inner_decorator_signature(span) for span in run}
+        if (
+            len(run) < 2
+            or len(decorators) < 2
+            or not any(span.get("_restyle_split") for span in run)
+        ):
+            result.extend(run)
+            pos = stop
+            continue
+
+        inner_spans = []
+        for span in run:
+            inner = dict(span)
+            inner["flags"] &= ~(
+                pymupdf.TEXT_FONT_BOLD | pymupdf.TEXT_FONT_ITALIC
+            )
+            inner["char_flags"] &= ~pymupdf.mupdf.FZ_STEXT_BOLD
+            inner_spans.append(inner)
+        inner_text, _ = _get_styled_text_legacy(inner_spans, geom_sup=geom_sup)
+
+        combined = dict(run[0])
+        combined["text"] = inner_text.rstrip()
+        combined["char_flags"] &= ~(
+            pymupdf.mupdf.FZ_STEXT_STRIKEOUT
+            | pymupdf.mupdf.FZ_STEXT_UNDERLINE
+            | pymupdf.mupdf.FZ_STEXT_HIGHLIGHT
+        )
+        combined["bbox"] = pymupdf.Rect(run[0]["bbox"])
+        for span in run[1:]:
+            combined["bbox"] |= pymupdf.Rect(span["bbox"])
+        result.append(combined)
+        pos = stop
+    return result
+
+
+def get_styled_text(spans, geom_sup=True):
+    """Output styled text while preserving common outer bold/italic runs."""
+    spans = _coalesce_outer_style_runs(spans, geom_sup)
+    return _get_styled_text_legacy(spans, geom_sup=geom_sup)
 
 
 def list_item_to_md(textlines, level):
@@ -615,6 +768,466 @@ def footnote_to_md(textlines):
     return output + "\n\n"
 
 
+def _thin_hlines(page):
+    """Return plausible vector text decorators on *page*.
+
+    ReStyle D8 (TextStyle Recovery) deliberately accepts only isolated, thin,
+    horizontal, solid paths.  In particular, dashed review connectors and the
+    horizontal sides of annotation boxes must not become text underlines.
+    Whether a candidate actually is a decorator is decided later from its
+    alignment with character geometry.
+    """
+    hlines = []
+    for path in page.get_drawings():
+        items = path.get("items", ())
+        if len(items) != 1:
+            continue  # boxes, callouts and other compound graphics
+        dashes = (path.get("dashes") or "").replace(" ", "")
+        if dashes not in ("", "[]0"):
+            continue
+
+        item = items[0]
+        if item[0] == "l":
+            p0, p1 = item[1:3]
+            if abs(p0.y - p1.y) > 0.2:
+                continue
+            x0, x1 = sorted((p0.x, p1.x))
+            y = (p0.y + p1.y) / 2
+            width = path.get("width") or 0
+            color = path.get("color")
+        elif item[0] == "re":
+            rect = pymupdf.Rect(item[1])
+            if rect.height > 1.5:
+                continue
+            x0, x1 = rect.x0, rect.x1
+            y = (rect.y0 + rect.y1) / 2
+            width = max(path.get("width") or 0, rect.height)
+            color = path.get("fill") or path.get("color")
+        else:
+            continue
+
+        if x1 - x0 < 3 or width > 1.5:
+            continue
+        if (path.get("stroke_opacity") or 1) < 0.5 or (
+            path.get("fill_opacity") or 1
+        ) < 0.5:
+            continue
+        if color is not None and min(color) > 0.95:
+            continue  # white knockout / annotation-box fill
+        hlines.append((x0, y, x1, width))
+    return hlines
+
+
+def _is_ocr_page(blocks):
+    """Return whether *blocks* predominantly contain invisible OCR text."""
+    spans = [
+        span
+        for block in blocks
+        if block.get("type") == 0
+        for line in block.get("lines", ())
+        for span in line.get("spans", ())
+        if span.get("text", "").strip()
+    ]
+    if not spans:
+        return False
+    ocr_spans = sum(utils.is_ocr_text(span) for span in spans)
+    return ocr_spans / len(spans) >= 0.8
+
+
+def _pixel_hlines(page, dpi):
+    """Return straight raster underline candidates in PDF coordinates.
+
+    ReStyle D9 only examines pages whose text is predominantly an invisible OCR
+    layer. At OCR resolution, dark horizontal runs are gap-closed per row and
+    retained only when a similarly long run is stable across adjacent rows.
+    The returned tuples match ``_thin_hlines``: ``(x0, y, x1, width)``.
+    Character alignment and form-rule rejection remain the responsibility of
+    ``_apply_decorators``.
+    """
+    raw = page.get_text("dict", flags=FLAGS)
+    if not _is_ocr_page(raw.get("blocks", ())):
+        return []
+
+    pix = page.get_pixmap(dpi=dpi, colorspace=pymupdf.csGRAY, alpha=False)
+    scale = dpi / 72
+    samples = np.frombuffer(pix.samples_mv, dtype=np.uint8)
+    gray = samples.reshape(pix.height, pix.stride)[:, : pix.width]
+    dark = gray < 200
+
+    # Restrict the expensive run search to the underline band of OCR baselines.
+    active_rows = np.zeros(pix.height, dtype=bool)
+    for block in raw.get("blocks", ()):
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", ()):
+            if abs(line.get("dir", (1, 0))[0] - 1) > 1e-3:
+                continue
+            for span in line.get("spans", ()):
+                if not span.get("text", "").strip() or not utils.is_ocr_text(span):
+                    continue
+                baseline = span["origin"][1]
+                size = span["size"]
+                y0 = round((baseline - 0.08 * size) * scale) - pix.y
+                y1 = round((baseline + 0.42 * size) * scale) - pix.y
+                y0 = max(0, y0)
+                y1 = min(pix.height - 1, y1)
+                if y0 <= y1:
+                    active_rows[y0 : y1 + 1] = True
+
+    gap = max(1, round(dpi / 75))  # 4 pixels at the default 300 dpi
+    min_length = max(3, round(30 * scale))
+    max_length = round(0.72 * pix.width)
+    row_runs = []
+    for y in np.flatnonzero(active_rows):
+        xs = np.flatnonzero(dark[y])
+        if not len(xs):
+            continue
+        starts = np.r_[0, np.flatnonzero(np.diff(xs) > gap + 1) + 1]
+        stops = np.r_[starts[1:], len(xs)]
+        for start, stop in zip(starts, stops):
+            x0 = int(xs[start])
+            x1 = int(xs[stop - 1]) + 1
+            length = x1 - x0
+            if (
+                min_length <= length <= max_length
+                and (stop - start) / length >= 0.70
+            ):
+                row_runs.append((int(y), x0, x1))
+
+    if not row_runs:
+        return []
+
+    # Join stable runs in neighboring rows. Normal glyph strokes tend to be
+    # shorter or change extent rapidly; a straight underline repeats its
+    # horizontal extent over multiple scan rows.
+    parents = list(range(len(row_runs)))
+
+    def root(item):
+        while parents[item] != item:
+            parents[item] = parents[parents[item]]
+            item = parents[item]
+        return item
+
+    def union(left, right):
+        left_root = root(left)
+        right_root = root(right)
+        if left_root != right_root:
+            parents[right_root] = left_root
+
+    rows_to_runs = defaultdict(list)
+    for index, (y, x0, x1) in enumerate(row_runs):
+        for other in rows_to_runs[y - 1]:
+            _, other_x0, other_x1 = row_runs[other]
+            overlap = min(x1, other_x1) - max(x0, other_x0)
+            shorter = min(x1 - x0, other_x1 - other_x0)
+            if overlap >= 0.10 * shorter:
+                union(index, other)
+        rows_to_runs[y].append(index)
+
+    grouped = defaultdict(list)
+    for index, run in enumerate(row_runs):
+        grouped[root(index)].append(run)
+    components = grouped.values()
+
+    hlines = []
+    # A straight scan line can be slightly skewed, so its component may span
+    # several rows vertically even though its effective stroke is still thin.
+    max_vertical_span = max(2, round(4 * scale))
+    max_thickness = max(2, round(2 * scale))
+    for component in components:
+        rows = sorted({item[0] for item in component})
+        if len(rows) < 2 or rows[-1] - rows[0] + 1 > max_vertical_span:
+            continue
+        x0 = min(item[1] for item in component)
+        x1 = max(item[2] for item in component)
+        thickness = sum(item[2] - item[1] for item in component) / (x1 - x0)
+        if thickness > max_thickness:
+            continue
+        # Gap closing tolerates antialiasing and scan breaks, but a semantic
+        # underline still contains a long, genuinely solid stroke. Dashed box
+        # borders can have high gap-closed fill while no row has a long
+        # uninterrupted run.
+        solid_ratio = 0
+        for row in rows:
+            segment = dark[row, x0:x1]
+            indexes = np.flatnonzero(segment)
+            if not len(indexes):
+                continue
+            starts = np.r_[0, np.flatnonzero(np.diff(indexes) > 1) + 1]
+            stops = np.r_[starts[1:], len(indexes)]
+            longest = max(
+                indexes[stop - 1] - indexes[start] + 1
+                for start, stop in zip(starts, stops)
+            )
+            solid_ratio = max(solid_ratio, longest / (x1 - x0))
+        if solid_ratio < 0.50:
+            continue
+        y = sum(rows) / len(rows)
+        width = thickness / scale
+        pdf_y = (y + pix.y) / scale
+        if pdf_y >= 0.90 * page.rect.height:
+            continue  # footer ornaments are not text decorators
+        hlines.append(
+            (
+                (x0 + pix.x) / scale,
+                pdf_y,
+                (x1 + pix.x) / scale,
+                width,
+            )
+        )
+
+    # Dense, regularly repeated parallel rules are cell / advertisement-grid
+    # structure. Real underlines remain locally sparse even on multi-line text.
+    return [
+        hline
+        for hline in hlines
+        if sum(abs(other[1] - hline[1]) <= 50 for other in hlines) <= 12
+    ]
+
+
+def _span_raw_chars(span, raw_chars):
+    """Map a possibly merged get_raw_lines span back to RAWDICT characters."""
+    bbox = pymupdf.Rect(span["bbox"])
+    baseline = span["origin"][1]
+    size = span["size"]
+    chars = []
+    seen = set()
+    for char in raw_chars:
+        cbbox = pymupdf.Rect(char["bbox"])
+        center_x = (cbbox.x0 + cbbox.x1) / 2
+        if not (bbox.x0 - 0.1 <= center_x <= bbox.x1 + 0.1):
+            continue
+        if abs(char["origin"][1] - baseline) > max(0.5, 0.1 * size):
+            continue
+        key = (char["c"], tuple(char["bbox"]), tuple(char["origin"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        chars.append(char)
+    chars.sort(key=lambda c: (c["origin"][0], c["bbox"][0]))
+    if "".join(c["c"] for c in chars) != span["text"]:
+        return []
+    return chars
+
+
+def _apply_decorators(textlines, raw_blocks, hlines, *, underline_only=False):
+    """Recover strike/underline styling at exact character boundaries.
+
+    ``underline_only`` is used for D9 raster candidates, which must never
+    synthesize a strikeout.
+    """
+    if not textlines or not raw_blocks or not hlines:
+        return
+
+    raw_chars = []
+    for block in raw_blocks:
+        for line in block.get("lines", ()):
+            if abs(line.get("dir", (1, 0))[0] - 1) > 1e-3:
+                continue
+            for span in line.get("spans", ()):
+                for char in span.get("chars", ()):
+                    item = dict(char)
+                    item["size"] = span["size"]
+                    item["char_flags"] = span["char_flags"]
+                    raw_chars.append(item)
+
+    spans = [span for line in textlines for span in line.get("spans", ())]
+    mapped = [_span_raw_chars(span, raw_chars) for span in spans]
+    char_refs = [
+        (sno, cno, char)
+        for sno, chars in enumerate(mapped)
+        for cno, char in enumerate(chars)
+    ]
+    if not char_refs:
+        return
+
+    strike = pymupdf.mupdf.FZ_STEXT_STRIKEOUT
+    underline = pymupdf.mupdf.FZ_STEXT_UNDERLINE
+    underline_lower = -0.42 if underline_only else -0.30
+    underline_upper = 0.02 if underline_only else 0.08
+    recovered = {strike: set(), underline: set()}
+    touched = {strike: set(), underline: set()}
+
+    for x0, y, x1, width in hlines:
+        possible = {underline: []} if underline_only else {strike: [], underline: []}
+        for sno, cno, char in char_refs:
+            cbbox = pymupdf.Rect(char["bbox"])
+            cx = (cbbox.x0 + cbbox.x1) / 2
+            if not (x0 - 0.1 <= cx <= x1 + 0.1):
+                continue
+            size = char["size"]
+            baseline = char["origin"][1]
+            rel_y = (baseline - y) / size
+            if not underline_only and 0.15 <= rel_y <= 0.65:
+                possible[strike].append((sno, cno, char, abs(rel_y - 0.28)))
+            elif underline_lower <= rel_y <= underline_upper:
+                possible[underline].append(
+                    (sno, cno, char, abs(rel_y + 0.12))
+                )
+
+        choices = [
+            (sum(item[3] for item in items) / len(items), flag, items)
+            for flag, items in possible.items()
+            if items and any(item[2]["c"].isalnum() for item in items)
+        ]
+        if not choices:
+            continue
+        _, flag, items = min(choices, key=lambda item: item[0])
+
+        # A real decorator begins and ends at its text.  Reject form rules,
+        # margin connectors and other lines which extend well outside the
+        # character run they appear to cover.
+        covered = [pymupdf.Rect(item[2]["bbox"]) for item in items]
+        text_x0 = min(rect.x0 for rect in covered)
+        text_x1 = max(rect.x1 for rect in covered)
+        size = sorted(item[2]["size"] for item in items)[len(items) // 2]
+        tolerance = max(1.5, 0.35 * size)
+        if text_x0 - x0 > tolerance or x1 - text_x1 > tolerance:
+            continue
+        minimum_width_limit = 1.5 if underline_only else 1.0
+        if width > max(minimum_width_limit, 0.15 * size):
+            continue
+
+        selected = {(item[0], item[1]) for item in items}
+        if underline_only:
+            # OCR boxes and antialiased raster lines can put the endpoint
+            # inside a punctuation glyph even though its centre lies just
+            # outside. Preserve adjacent punctuation whose box actually
+            # intersects the detected line.
+            additions = set()
+            for sno, cno, char in char_refs:
+                if char["c"].isalnum() or char["c"].isspace():
+                    continue
+                if not (
+                    (sno, cno - 1) in selected or (sno, cno + 1) in selected
+                ):
+                    continue
+                cbbox = pymupdf.Rect(char["bbox"])
+                rel_y = (char["origin"][1] - y) / char["size"]
+                if (
+                    underline_lower <= rel_y <= underline_upper
+                    and cbbox.x1 >= x0 - 0.1
+                    and cbbox.x0 <= x1 + 0.1
+                ):
+                    additions.add((sno, cno))
+            selected.update(additions)
+        recovered[flag].update(selected)
+        # MuPDF may assign a line's flag to the glyph immediately beyond an
+        # endpoint.  Include endpoint-touching spans in the range we rebuild,
+        # while still setting the recovered flag by character centre only.
+        for sno, cno, char in char_refs:
+            cbbox = pymupdf.Rect(char["bbox"])
+            size = char["size"]
+            baseline = char["origin"][1]
+            rel_y = (baseline - y) / size
+            aligned = (
+                flag == strike
+                and 0.15 <= rel_y <= 0.65
+                or flag == underline
+                and underline_lower <= rel_y <= underline_upper
+            )
+            if aligned and cbbox.x1 >= x0 - 0.1 and cbbox.x0 <= x1 + 0.1:
+                touched[flag].add(sno)
+
+    for sno, span in enumerate(spans):
+        chars = mapped[sno]
+        if not chars or not any(sno in touched[flag] for flag in touched):
+            continue
+        pieces = []
+        for cno, char in enumerate(chars):
+            flags = char["char_flags"]
+            if underline_only:
+                # Preserve D8 decorators and any underline already carried by
+                # this (possibly split) span.
+                flags |= span["char_flags"] & (strike | underline)
+            for flag in (strike, underline):
+                if sno in touched[flag]:
+                    if underline_only and flag == underline and flags & underline:
+                        continue
+                    flags &= ~flag
+                    if (sno, cno) in recovered[flag]:
+                        flags |= flag
+            if pieces and pieces[-1][0] == flags:
+                pieces[-1][1].append(char)
+            else:
+                pieces.append([flags, [char]])
+
+        replacements = []
+        for flags, piece_chars in pieces:
+            piece_text = "".join(char["c"] for char in piece_chars)
+            if not piece_text.strip():
+                # get_styled_text strips span text before adding its wrappers.
+                # Keeping a whitespace-only split would therefore emit empty
+                # markers (for example **<mark></mark>**) and interrupt the
+                # surrounding bold/highlight run. Its layout gap still makes
+                # get_styled_text insert the required separating space.
+                continue
+            replacement = dict(span)
+            replacement["text"] = piece_text
+            replacement["char_flags"] = flags
+            replacement["bbox"] = pymupdf.Rect(piece_chars[0]["bbox"])
+            for char in piece_chars[1:]:
+                replacement["bbox"] |= pymupdf.Rect(char["bbox"])
+            replacement["origin"] = piece_chars[0]["origin"]
+            replacement["_restyle_split"] = True
+            replacements.append(replacement)
+
+        for line in textlines:
+            if span in line.get("spans", ()):
+                pos = line["spans"].index(span)
+                line["spans"][pos : pos + 1] = replacements
+                break
+
+    # get_styled_text normally inserts a space between every pair of spans.
+    # RAWDICT boundaries can instead be two touching fragments of one word;
+    # remember those joins whenever D8 split either side of the boundary.
+    for line in textlines:
+        line_spans = line.get("spans", ())
+        for pos in range(1, len(line_spans)):
+            prev = line_spans[pos - 1]
+            curr = line_spans[pos]
+            if not (prev.get("_restyle_split") or curr.get("_restyle_split")):
+                continue
+            if prev["text"].endswith((" ", "\t")) or curr["text"].startswith(
+                (" ", "\t")
+            ):
+                continue
+            size = max(prev["size"], curr["size"])
+            same_baseline = abs(prev["origin"][1] - curr["origin"][1]) <= 0.1 * size
+            gap = curr["bbox"].x0 - prev["bbox"].x1
+            if same_baseline and abs(gap) <= 0.1 * size:
+                curr["_restyle_join_left"] = True
+
+
+def _leading_bold_title_lines(textlines):
+    """ReStyle D4 (TextStyle Recovery): count the leading, fully-bold, short lines
+    that form a title at the START of a text box. The layout model only marks
+    font-size/geometry titles, so a body-size bold title (`**Legal Notices**`, or
+    `**DRAFT RED HERRING PROSPECTUS**` followed by non-bold `Dated April 24,
+    2025 ...`) is otherwise emitted inline and misses `is_title`. Emit the leading
+    bold line(s) as a heading and the rest of the box as body. The whole box is
+    the title when every line is bold. Returns 0 if the box does not begin with a
+    bold title, or if the bold prefix is too long to be a title (> 12 words).
+    """
+    n = 0
+    words = 0
+    for l in textlines:
+        spans = [s for s in l.get("spans", []) if (s.get("text") or "").strip()]
+        if not spans:
+            break
+        all_bold = all(
+            (s["flags"] & pymupdf.TEXT_FONT_BOLD) or (s["char_flags"] & pymupdf.mupdf.FZ_STEXT_BOLD)
+            for s in spans
+        )
+        if not all_bold:
+            break
+        words += len(" ".join((s.get("text") or "") for s in spans).split())
+        n += 1
+        if words > 12:  # too long to be a title
+            return 0
+    return n if words >= 1 else 0
+
+
 def section_hdr_to_md(header_level, textlines):
     """
     Convert "section-header" bboxes to markdown.
@@ -624,7 +1237,7 @@ def section_hdr_to_md(header_level, textlines):
         for s in l["spans"]:
             assert isinstance(s, dict)
             spans.append(s)
-    output, suffix = get_styled_text(spans)
+    output, suffix = get_styled_text(spans, geom_sup=False)
     return f"{'#' * header_level} {output}\n\n"
 
 
@@ -639,7 +1252,7 @@ def title_to_md(header_level, textlines):
         for s in l["spans"]:
             assert isinstance(s, dict)
             spans.append(s)
-    output, suffix = get_styled_text(spans)
+    output, suffix = get_styled_text(spans, geom_sup=False)
     return f"{'#' * header_level} {output}\n\n"
 
 
@@ -787,6 +1400,16 @@ class ParsedDocument:
         else:
             document_output = ""
 
+        # ReStyle D4: level for promoting bold-title body boxes — one below the
+        # deepest real title/section-header so promotion least disturbs hierarchy.
+        _lvls = [
+            b.header_level
+            for p in self.pages
+            for b in p.boxes
+            if b.boxclass in ("title", "section-header") and b.header_level
+        ]
+        _promote_lvl = min(6, max(_lvls) + 1) if _lvls else 2
+
         if show_progress and len(self.pages) > 5:
             print(f"Generating markdown text...")
             this_iterator = ProgressBar(self.pages)
@@ -856,10 +1479,19 @@ class ParsedDocument:
                 elif btype == "footnote":
                     md_string += footnote_to_md(box.textlines)
                     string_lengths.append(len(md_string))
-                else:  # treat as normal MD text
-                    md_string += text_to_md(
-                        box.textlines, ignore_code=ignore_code or page.full_ocred
-                    )
+                else:  # normal text — or a leading bold title (ReStyle D4)
+                    _n = _leading_bold_title_lines(box.textlines)
+                    if _n:  # box starts with a bold title line -> promote it
+                        md_string += section_hdr_to_md(_promote_lvl, box.textlines[:_n])
+                        if _n < len(box.textlines):  # remaining lines are body text
+                            md_string += text_to_md(
+                                box.textlines[_n:],
+                                ignore_code=ignore_code or page.full_ocred,
+                            )
+                    else:
+                        md_string += text_to_md(
+                            box.textlines, ignore_code=ignore_code or page.full_ocred
+                        )
                     string_lengths.append(len(md_string))
             if page_separators:
                 md_string += f"--- end of {page.page_number=} ---\n\n"
@@ -1214,6 +1846,8 @@ def parse_document(
         tables_exist = any(
             b for b in page.layout_information if b["class_name"] == "table"
         )
+        hlines = _thin_hlines(page)
+        pixel_hlines = _pixel_hlines(page, ocr_dpi) if _is_ocr_page(blocks) else []
 
         # Dictionary with details for all tables. Key is the bounding box
         # tuple, value is the original Layout info per table.
@@ -1240,10 +1874,14 @@ def parse_document(
             page.rect, blocks, page.layout_information
         )
         fulltext = [b for b in blocks if b["type"] == 0]
-        if tables_exist:
-            table_blocks = [
+        if tables_exist or hlines or pixel_hlines:
+            raw_blocks = [
                 b for b in textpage.extractRAWDICT()["blocks"] if b["type"] == 0
             ]
+        else:
+            raw_blocks = None
+        if tables_exist:
+            table_blocks = raw_blocks
         else:
             table_blocks = None
 
@@ -1326,6 +1964,19 @@ def parse_document(
                         ignore_invisible=False,
                     )
                 ]
+                if layoutbox.boxclass not in (
+                    "title",
+                    "section-header",
+                    "page-header",
+                    "page-footer",
+                ):
+                    _apply_decorators(layoutbox.textlines, raw_blocks, hlines)
+                _apply_decorators(
+                    layoutbox.textlines,
+                    raw_blocks,
+                    pixel_hlines,
+                    underline_only=True,
+                )
                 # For each title/section_header compute and store the maximum
                 # font size, to be used as a signal for header "#" prefix
                 if layoutbox.boxclass in ("title", "section-header"):
